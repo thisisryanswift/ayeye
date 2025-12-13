@@ -65,14 +65,13 @@ async fn run_interactive() -> Result<()> {
     
     println!("Analysis complete: {}", analysis.title);
     
-    // Save the issue
+    // Save the issue - check if we're in a beads project
     let cwd = std::env::current_dir()?;
+    let is_beads_project = cwd.join(".beads").is_dir() || cwd.join("beads.toml").is_file();
     
-    if is_beads_directory(&cwd) {
-        // Create beads issue
+    if is_beads_project {
         create_beads_issue(&analysis, &output_path).await?;
     } else {
-        // Create markdown file in current directory
         create_markdown_issue(&analysis, &output_path, &timestamp.to_string()).await?;
     }
     
@@ -81,20 +80,15 @@ async fn run_interactive() -> Result<()> {
     Ok(())
 }
 
-fn is_beads_directory(path: &std::path::Path) -> bool {
-    // Check for .beads directory or beads.toml
-    path.join(".beads").is_dir() || path.join("beads.toml").is_file()
-}
-
 async fn create_beads_issue(analysis: &analyzer::Analysis, video_path: &std::path::Path) -> Result<()> {
-    // Use bd CLI to create an issue
-    let body = format_issue_body(analysis, video_path);
+    let body = format_issue(analysis, video_path, false);
     
     let output = tokio::process::Command::new("bd")
         .args([
             "create",
             &analysis.title,
             "--type", "bug",
+            "--label", "video-report",
             "--description", &body,
         ])
         .output()
@@ -118,7 +112,7 @@ async fn create_markdown_issue(
     timestamp: &str,
 ) -> Result<()> {
     let filename = format!("issue-{}.md", timestamp);
-    let content = format_issue_markdown(analysis, video_path);
+    let content = format_issue(analysis, video_path, true);
     
     tokio::fs::write(&filename, &content).await?;
     println!("Created issue file: {}", filename);
@@ -126,55 +120,32 @@ async fn create_markdown_issue(
     Ok(())
 }
 
-fn format_issue_body(analysis: &analyzer::Analysis, video_path: &std::path::Path) -> String {
-    let mut body = String::new();
+fn format_issue(analysis: &analyzer::Analysis, video_path: &std::path::Path, include_title: bool) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
     
-    body.push_str(&analysis.summary);
-    body.push_str("\n\n## Steps to Reproduce\n\n");
+    if include_title {
+        writeln!(out, "# {}\n", analysis.title).unwrap();
+    }
+    writeln!(out, "{}\n", analysis.summary).unwrap();
     
+    out.push_str("## Steps to Reproduce\n\n");
     for (i, step) in analysis.steps.iter().enumerate() {
-        body.push_str(&format!("{}. {}\n", i + 1, step));
+        writeln!(out, "{}. {}", i + 1, step).unwrap();
     }
     
     if !analysis.timestamps.is_empty() {
-        body.push_str("\n## Timestamps\n\n");
+        out.push_str("\n## Timestamps\n\n");
         for ts in &analysis.timestamps {
             if ts.description.is_empty() {
-                body.push_str(&format!("- {}\n", ts.time));
+                writeln!(out, "- {}", ts.time).unwrap();
             } else {
-                body.push_str(&format!("- **{}** - {}\n", ts.time, ts.description));
+                writeln!(out, "- **{}** - {}", ts.time, ts.description).unwrap();
             }
         }
     }
     
-    body.push_str(&format!("\n## Recording\n\n`{}`\n", video_path.display()));
+    writeln!(out, "\n## Recording\n\n`{}`", video_path.display()).unwrap();
     
-    body
-}
-
-fn format_issue_markdown(analysis: &analyzer::Analysis, video_path: &std::path::Path) -> String {
-    let mut md = String::new();
-    
-    md.push_str(&format!("# {}\n\n", analysis.title));
-    md.push_str(&format!("{}\n\n", analysis.summary));
-    
-    md.push_str("## Steps to Reproduce\n\n");
-    for (i, step) in analysis.steps.iter().enumerate() {
-        md.push_str(&format!("{}. {}\n", i + 1, step));
-    }
-    
-    if !analysis.timestamps.is_empty() {
-        md.push_str("\n## Timestamps\n\n");
-        for ts in &analysis.timestamps {
-            if ts.description.is_empty() {
-                md.push_str(&format!("- {}\n", ts.time));
-            } else {
-                md.push_str(&format!("- **{}** - {}\n", ts.time, ts.description));
-            }
-        }
-    }
-    
-    md.push_str(&format!("\n## Recording\n\n`{}`\n", video_path.display()));
-    
-    md
+    out
 }

@@ -1,8 +1,22 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config;
+
+/// Max time to wait for Gemini to process the uploaded video
+const PROCESSING_TIMEOUT_SECS: u64 = 300; // 5 minutes
+
+/// Guard that deletes a temp file on drop
+struct TempFileGuard(Option<PathBuf>);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Analysis {
@@ -19,16 +33,61 @@ pub struct Timestamp {
     pub description: String,
 }
 
+// Gemini API response types
+#[derive(Deserialize)]
+struct UploadResponse {
+    file: FileInfo,
+}
+
+#[derive(Deserialize)]
+struct FileInfo {
+    name: String,
+    uri: String,
+}
+
+#[derive(Deserialize)]
+struct FileStatus {
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct GenerateResponse {
+    candidates: Vec<Candidate>,
+}
+
+#[derive(Deserialize)]
+struct Candidate {
+    content: Content,
+}
+
+#[derive(Deserialize)]
+struct Content {
+    parts: Vec<Part>,
+}
+
+#[derive(Deserialize)]
+struct Part {
+    text: String,
+}
+
 pub async fn analyze(video_path: &Path) -> Result<Analysis> {
     let api_key = config::gemini_api_key()
         .ok_or_else(|| anyhow!("GEMINI_API_KEY not set"))?;
     
     let client = reqwest::Client::new();
     
-    // If MKV, convert to MP4 first (Gemini doesn't like MKV)
-    let (final_path, _temp_file) = if video_path.extension().map(|e| e == "mkv").unwrap_or(false) {
+    // If MKV, convert to MP4 first (Gemini doesn't support MKV)
+    let (final_path, _temp_guard) = if video_path.extension().map(|e| e == "mkv").unwrap_or(false) {
         eprintln!("Converting MKV to MP4 for upload...");
-        let mp4_path = video_path.with_extension("mp4");
+        let unique_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mp4_path = std::env::temp_dir().join(format!(
+            "ayeye-{}-{}.mp4",
+            video_path.file_stem().and_then(|s| s.to_str()).unwrap_or("video"),
+            unique_id
+        ));
         
         let output = tokio::process::Command::new("ffmpeg")
             .args([
@@ -47,10 +106,9 @@ pub async fn analyze(video_path: &Path) -> Result<Analysis> {
             return Err(anyhow!("ffmpeg conversion failed: {}", stderr));
         }
         
-        // Return path and keep temp file reference
-        (mp4_path.clone(), Some(mp4_path))
+        (mp4_path.clone(), TempFileGuard(Some(mp4_path)))
     } else {
-        (video_path.to_path_buf(), None)
+        (video_path.to_path_buf(), TempFileGuard(None))
     };
     
     // Read the file
@@ -113,24 +171,18 @@ pub async fn analyze(video_path: &Path) -> Result<Analysis> {
         return Err(anyhow!("Upload failed: {}", error_text));
     }
     
-    #[derive(Deserialize)]
-    struct UploadResponse {
-        file: FileInfo,
-    }
-    
-    #[derive(Deserialize)]
-    struct FileInfo {
-        name: String,
-        uri: String,
-    }
-    
     let upload_result: UploadResponse = upload_response.json().await?;
     let file_uri = upload_result.file.uri;
     
     eprintln!("Upload complete, waiting for processing...");
     
-    // Wait for processing
+    // Wait for processing with timeout
+    let processing_start = std::time::Instant::now();
     loop {
+        if processing_start.elapsed().as_secs() > PROCESSING_TIMEOUT_SECS {
+            return Err(anyhow!("Timeout waiting for video processing ({}s)", PROCESSING_TIMEOUT_SECS));
+        }
+        
         let status_url = format!(
             "https://generativelanguage.googleapis.com/v1beta/{}?key={}",
             upload_result.file.name,
@@ -138,14 +190,8 @@ pub async fn analyze(video_path: &Path) -> Result<Analysis> {
         );
         
         let status_response = client.get(&status_url).send().await?;
-        
-        #[derive(Deserialize)]
-        struct StatusResponse {
-            state: String,
-        }
-        
         let status_text = status_response.text().await?;
-        let status: StatusResponse = serde_json::from_str(&status_text)
+        let status: FileStatus = serde_json::from_str(&status_text)
             .map_err(|e| anyhow!("Failed to parse status: {}. Response: {}", e, status_text))?;
         
         eprintln!("File status: {}", status.state);
@@ -220,26 +266,6 @@ pub async fn analyze(video_path: &Path) -> Result<Analysis> {
         return Err(anyhow!("Generation failed: {}", error_text));
     }
     
-    #[derive(Deserialize)]
-    struct GenerateResponse {
-        candidates: Vec<Candidate>,
-    }
-    
-    #[derive(Deserialize)]
-    struct Candidate {
-        content: Content,
-    }
-    
-    #[derive(Deserialize)]
-    struct Content {
-        parts: Vec<Part>,
-    }
-    
-    #[derive(Deserialize)]
-    struct Part {
-        text: String,
-    }
-    
     let result: GenerateResponse = response.json().await?;
     
     let text = result.candidates
@@ -251,5 +277,6 @@ pub async fn analyze(video_path: &Path) -> Result<Analysis> {
     let analysis: Analysis = serde_json::from_str(text)
         .map_err(|e| anyhow!("Failed to parse response: {}. Raw response: {}", e, text))?;
     
+    // _temp_guard drops here, cleaning up the temp file
     Ok(analysis)
 }

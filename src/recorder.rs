@@ -5,6 +5,10 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+/// Extra delay after stream-start to ensure stable frame delivery.
+/// PipeWire portal streams need time to fully initialize after the first frame.
+const STREAM_STABILIZATION_DELAY_MS: u64 = 500;
+
 pub async fn record(node_id: u32, output_path: &Path, stop_signal: Arc<Notify>) -> Result<()> {
     gst::init()?;
     
@@ -80,8 +84,7 @@ pub async fn record(node_id: u32, output_path: &Path, stop_signal: Arc<Notify>) 
             }
         }
         
-        // Give a little extra time for the stream to stabilize
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(STREAM_STABILIZATION_DELAY_MS));
         
         Ok(())
     }).await??;
@@ -111,15 +114,8 @@ pub async fn record(node_id: u32, output_path: &Path, stop_signal: Arc<Notify>) 
                     break;
                 }
                 gst::MessageView::Error(e) => {
-                    let err = e.error();
-                    let debug = e.debug();
-                    eprintln!("GStreamer error during shutdown: {:?} ({:?})", err, debug);
+                    eprintln!("GStreamer error during shutdown: {:?}", e.error());
                     break;
-                }
-                gst::MessageView::StateChanged(s) => {
-                    if s.src().map(|s| s == pipeline_clone.upcast_ref::<gst::Object>()).unwrap_or(false) {
-                        eprintln!("State changed to: {:?}", s.current());
-                    }
                 }
                 _ => {}
             }
